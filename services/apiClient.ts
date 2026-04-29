@@ -1,0 +1,725 @@
+import { getAccessToken } from '@/auth/authSession';
+import type {
+  ApiAnnotation,
+  ApiComparisonDraft,
+  ApiComparisonDraftDetail,
+  ApiConversionStatus,
+  ApiMediaFile,
+  ApiMyUpload,
+  ApiProject,
+  ApiReport,
+  ApiRoom,
+  ApiRoomMediaGroup,
+  ApiViewerFieldDraft,
+  ApiViewerFieldDraftDetail,
+  DateMediaCounts,
+  ExplorerByDateResponse,
+  ExplorerByRoomResponse,
+  ExplorerDatesSummaryResponse,
+  TokenResponse,
+  UploadSingleResponse,
+} from '@/types/api';
+
+/**
+ * The browser always hits a relative `/api` path. The Next.js server
+ * proxies `/api/*` to the backend via the rewrite rule in `next.config.mjs`,
+ * which reads `BACKEND_URL` at runtime. This avoids CORS in every environment.
+ */
+export const API_BASE = '/api';
+
+async function parseApiError(response: Response): Promise<string> {
+  try {
+    const j = (await response.json()) as { detail?: unknown };
+    const d = j.detail;
+    if (typeof d === 'string') return d;
+    if (Array.isArray(d)) {
+      return d
+        .map((x: { msg?: string }) => x?.msg)
+        .filter(Boolean)
+        .join(', ');
+    }
+  } catch {
+    /* ignore */
+  }
+  return `Request failed: ${response.status}`;
+}
+
+async function apiFetch(path: string, init?: RequestInit, withAuth = true): Promise<Response> {
+  const headers = new Headers(init?.headers);
+  if (withAuth) {
+    const t = getAccessToken();
+    if (t) headers.set('Authorization', `Bearer ${t}`);
+  }
+  return fetch(`${API_BASE}${path}`, { ...init, headers });
+}
+
+async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await apiFetch(path, init, true);
+  if (!response.ok) {
+    throw new Error(await parseApiError(response));
+  }
+  return response.json() as Promise<T>;
+}
+
+function addRoomGroupsToDateCounts(
+  acc: Record<string, DateMediaCounts>,
+  dates: Record<string, ApiRoomMediaGroup>,
+): void {
+  for (const [day, group] of Object.entries(dates)) {
+    const cur = acc[day] ?? { images: 0, videos: 0, pointclouds: 0, pdfs: 0 };
+    cur.images += group.images?.length ?? 0;
+    cur.videos += group.videos?.length ?? 0;
+    cur.pointclouds += group.pointclouds?.length ?? 0;
+    cur.pdfs += group.pdfs?.length ?? 0;
+    acc[day] = cur;
+  }
+}
+
+async function explorerDatesSummaryFromRooms(): Promise<ExplorerDatesSummaryResponse> {
+  const rooms = await getJson<ApiRoom[]>('/rooms');
+  const byDate: Record<string, DateMediaCounts> = {};
+  await Promise.all(
+    rooms.map((room) =>
+      getExplorerByRoom(room.slug).then((res) => {
+        addRoomGroupsToDateCounts(byDate, res.dates ?? {});
+      }),
+    ),
+  );
+  return { dates: byDate };
+}
+
+// ---------- Auth ----------
+
+export async function apiLogin(username: string, password: string): Promise<TokenResponse> {
+  const response = await apiFetch(
+    '/auth/login',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    },
+    false,
+  );
+  if (!response.ok) throw new Error(await parseApiError(response));
+  return response.json() as Promise<TokenResponse>;
+}
+
+export async function apiRegister(
+  username: string,
+  password: string,
+  email?: string,
+): Promise<TokenResponse> {
+  const response = await apiFetch(
+    '/auth/register',
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        username,
+        password,
+        email: email?.trim() || null,
+      }),
+    },
+    false,
+  );
+  if (!response.ok) throw new Error(await parseApiError(response));
+  return response.json() as Promise<TokenResponse>;
+}
+
+export async function apiFetchCurrentUser(): Promise<TokenResponse['user']> {
+  const response = await apiFetch('/auth/me', { method: 'GET' }, true);
+  if (!response.ok) throw new Error(await parseApiError(response));
+  return response.json() as Promise<TokenResponse['user']>;
+}
+
+// ---------- Projects / Rooms ----------
+
+export function listProjects(): Promise<ApiProject[]> {
+  return getJson<ApiProject[]>('/projects/');
+}
+
+export async function listRooms(): Promise<ApiRoom[]> {
+  try {
+    return await getJson<ApiRoom[]>('/rooms/');
+  } catch {
+    return getJson<ApiRoom[]>('/rooms');
+  }
+}
+
+// ---------- Files / Explorer ----------
+
+export function getExplorerByDate(date: string): Promise<ExplorerByDateResponse> {
+  return getJson<ExplorerByDateResponse>(`/files/explorer/date/${date}`);
+}
+
+export function getExplorerByRoom(roomSlug: string): Promise<ExplorerByRoomResponse> {
+  return getJson<ExplorerByRoomResponse>(`/files/explorer/room/${roomSlug}`);
+}
+
+export async function getExplorerDatesSummary(): Promise<ExplorerDatesSummaryResponse> {
+  const response = await apiFetch('/files/explorer/dates', undefined, true);
+  if (response.ok) {
+    return response.json() as Promise<ExplorerDatesSummaryResponse>;
+  }
+  if (response.status === 404) {
+    return explorerDatesSummaryFromRooms();
+  }
+  throw new Error(await parseApiError(response));
+}
+
+export async function deleteFileAsset(fileId: string): Promise<void> {
+  const response = await apiFetch(`/files/${fileId}`, { method: 'DELETE' }, true);
+  if (!response.ok) throw new Error(await parseApiError(response));
+}
+
+export function getConversionStatus(fileId: string): Promise<ApiConversionStatus> {
+  return getJson<ApiConversionStatus>(`/files/${fileId}/conversion-status`);
+}
+
+export async function retryPointcloudConversion(fileId: string): Promise<void> {
+  const response = await apiFetch(`/files/${fileId}/retry-conversion`, { method: 'POST' }, true);
+  if (!response.ok) throw new Error(await parseApiError(response));
+}
+
+export function listMyUploads(): Promise<ApiMyUpload[]> {
+  return getJson<ApiMyUpload[]>('/files/my-uploads');
+}
+
+// ---------- AI ----------
+
+export async function analyzeImage(imageUrl: string, fileId?: string): Promise<string> {
+  const response = await getJson<{ description: string }>('/ai/analyze', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      image_url: imageUrl,
+      file_id: fileId ?? null,
+    }),
+  });
+  return response.description;
+}
+
+// ---------- Annotations ----------
+
+export function listAnnotations(fileId: string): Promise<ApiAnnotation[]> {
+  return getJson<ApiAnnotation[]>(`/annotations/file/${fileId}`);
+}
+
+export async function createAnnotation(
+  fileId: string,
+  x: number,
+  y: number,
+  text: string,
+): Promise<ApiAnnotation> {
+  return getJson<ApiAnnotation>('/annotations/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ file_id: fileId, x, y, text }),
+  });
+}
+
+// ---------- Uploads ----------
+
+const POINTCLOUD_CHUNK_SIZE = 64 * 1024 * 1024;
+const POINTCLOUD_UPLOAD_CONCURRENCY = 5;
+const POINTCLOUD_CHUNK_MAX_RETRIES = 3;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function uploadPointcloudInChunks(params: {
+  file: File;
+  roomSlug: string;
+  captureDate: string;
+  token: string;
+  onProgress?: (percent: number) => void;
+  signal?: AbortSignal;
+}): Promise<UploadSingleResponse> {
+  const initForm = new FormData();
+  initForm.append('room_slug', params.roomSlug);
+  initForm.append('capture_date', params.captureDate);
+  initForm.append('filename', params.file.name);
+  initForm.append('file_size', String(params.file.size));
+  initForm.append('content_type', params.file.type || 'application/octet-stream');
+
+  const initRes = await fetch(`${API_BASE}/upload/pointcloud/init`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${params.token}` },
+    body: initForm,
+    signal: params.signal,
+  });
+  if (!initRes.ok) throw new Error(await parseApiError(initRes));
+  const initData = (await initRes.json()) as { upload_id: string; chunk_size?: number };
+  const uploadId = initData.upload_id;
+  const chunkSize =
+    initData.chunk_size && initData.chunk_size > 0 ? initData.chunk_size : POINTCLOUD_CHUNK_SIZE;
+
+  const totalChunks = Math.ceil(params.file.size / chunkSize);
+  let uploadedBytes = 0;
+  params.onProgress?.(0);
+  const getNextChunkIndex = (() => {
+    let i = 0;
+    return () => (i < totalChunks ? i++ : null);
+  })();
+  const uploadOneChunkWithRetry = async (chunkIndex: number): Promise<void> => {
+    let attempt = 0;
+    while (attempt <= POINTCLOUD_CHUNK_MAX_RETRIES) {
+      const start = chunkIndex * chunkSize;
+      const end = Math.min(start + chunkSize, params.file.size);
+      const blob = params.file.slice(start, end);
+      const chunkForm = new FormData();
+      chunkForm.append('upload_id', uploadId);
+      chunkForm.append('chunk_index', String(chunkIndex));
+      chunkForm.append('chunk', blob, params.file.name);
+
+      const chunkRes = await fetch(`${API_BASE}/upload/pointcloud/chunk`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${params.token}` },
+        body: chunkForm,
+        signal: params.signal,
+      });
+      if (chunkRes.ok) {
+        uploadedBytes += end - start;
+        const percent = Math.min(99, Math.round((uploadedBytes / params.file.size) * 100));
+        params.onProgress?.(percent);
+        return;
+      }
+      const err = await parseApiError(chunkRes);
+      if (attempt >= POINTCLOUD_CHUNK_MAX_RETRIES) {
+        throw new Error(`Chunk ${chunkIndex + 1}/${totalChunks} failed: ${err}`);
+      }
+      await sleep(500 * 2 ** attempt);
+      attempt += 1;
+    }
+  };
+
+  const workers = Array.from(
+    { length: Math.min(POINTCLOUD_UPLOAD_CONCURRENCY, totalChunks) },
+    async () => {
+      while (true) {
+        const chunkIndex = getNextChunkIndex();
+        if (chunkIndex === null) return;
+        await uploadOneChunkWithRetry(chunkIndex);
+      }
+    },
+  );
+  for (const worker of workers) {
+    await worker;
+  }
+
+  const doneForm = new FormData();
+  doneForm.append('upload_id', uploadId);
+  doneForm.append('total_chunks', String(totalChunks));
+  const doneRes = await fetch(`${API_BASE}/upload/pointcloud/complete`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${params.token}` },
+    body: doneForm,
+    signal: params.signal,
+  });
+  if (!doneRes.ok) throw new Error(await parseApiError(doneRes));
+  params.onProgress?.(100);
+  return doneRes.json() as Promise<UploadSingleResponse>;
+}
+
+function uploadViaXhr(params: {
+  url: string;
+  method: string;
+  file: File;
+  contentType: string;
+  onProgress?: (percent: number) => void;
+  signal?: AbortSignal;
+}): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(params.method, params.url, true);
+    xhr.setRequestHeader('Content-Type', params.contentType);
+    xhr.upload.onprogress = (event) => {
+      if (!event.lengthComputable) return;
+      const percent = Math.min(99, Math.round((event.loaded / event.total) * 100));
+      params.onProgress?.(percent);
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        params.onProgress?.(100);
+        resolve();
+      } else {
+        reject(new Error(`Direct MinIO upload failed (${xhr.status})`));
+      }
+    };
+    xhr.onerror = () => reject(new Error('Direct MinIO upload failed (network error)'));
+    params.signal?.addEventListener(
+      'abort',
+      () => {
+        xhr.abort();
+        reject(new DOMException('Upload cancelled', 'AbortError'));
+      },
+      { once: true },
+    );
+    xhr.send(params.file);
+  });
+}
+
+async function uploadPointcloudDirect(params: {
+  file: File;
+  roomSlug: string;
+  captureDate: string;
+  token: string;
+  onProgress?: (percent: number) => void;
+  signal?: AbortSignal;
+}): Promise<UploadSingleResponse> {
+  const initForm = new FormData();
+  initForm.append('room_slug', params.roomSlug);
+  initForm.append('capture_date', params.captureDate);
+  initForm.append('filename', params.file.name);
+  initForm.append('file_size', String(params.file.size));
+  initForm.append('content_type', params.file.type || 'application/octet-stream');
+
+  const initRes = await fetch(`${API_BASE}/upload/pointcloud/direct-init`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${params.token}` },
+    body: initForm,
+    signal: params.signal,
+  });
+  if (!initRes.ok) throw new Error(await parseApiError(initRes));
+  const initData = (await initRes.json()) as {
+    upload_id: string;
+    upload_url: string;
+    method?: string;
+  };
+
+  await uploadViaXhr({
+    url: initData.upload_url,
+    method: initData.method || 'PUT',
+    file: params.file,
+    contentType: params.file.type || 'application/octet-stream',
+    onProgress: params.onProgress,
+    signal: params.signal,
+  });
+
+  const doneForm = new FormData();
+  doneForm.append('upload_id', initData.upload_id);
+  const doneRes = await fetch(`${API_BASE}/upload/pointcloud/direct-complete`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${params.token}` },
+    body: doneForm,
+    signal: params.signal,
+  });
+  if (!doneRes.ok) throw new Error(await parseApiError(doneRes));
+  return doneRes.json() as Promise<UploadSingleResponse>;
+}
+
+export async function uploadSingleFile(params: {
+  file: File;
+  roomSlug: string;
+  mediaType: 'image' | 'video' | 'pointcloud' | 'pdf';
+  captureDate: string;
+  onProgress?: (percent: number) => void;
+  signal?: AbortSignal;
+}): Promise<UploadSingleResponse> {
+  const token = getAccessToken();
+  if (!token) throw new Error('You must be signed in to upload.');
+
+  const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
+  if (params.file.size > MAX_UPLOAD_BYTES) {
+    throw new Error(
+      `File is too large (${(params.file.size / 1024 / 1024 / 1024).toFixed(2)} GB). The maximum upload size is 5 GB.`,
+    );
+  }
+
+  if (params.mediaType === 'pointcloud') {
+    try {
+      return await uploadPointcloudDirect({
+        file: params.file,
+        roomSlug: params.roomSlug,
+        captureDate: params.captureDate,
+        token,
+        onProgress: params.onProgress,
+        signal: params.signal,
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err;
+      const message = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[upload] Direct MinIO pointcloud upload failed, falling back to chunked upload: ${message}`,
+      );
+      return uploadPointcloudInChunks({
+        file: params.file,
+        roomSlug: params.roomSlug,
+        captureDate: params.captureDate,
+        token,
+        onProgress: params.onProgress,
+        signal: params.signal,
+      });
+    }
+  }
+
+  const form = new FormData();
+  form.append('file', params.file);
+  form.append('room_slug', params.roomSlug);
+  form.append('media_type', params.mediaType);
+  form.append('capture_date', params.captureDate);
+
+  const response = await fetch(`${API_BASE}/upload/single`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+    signal: params.signal,
+  });
+
+  if (!response.ok) throw new Error(await parseApiError(response));
+  return response.json() as Promise<UploadSingleResponse>;
+}
+
+// ---------- Reports ----------
+
+export function listReports(): Promise<ApiReport[]> {
+  return getJson<ApiReport[]>('/reports/');
+}
+
+export async function deleteReport(reportId: string): Promise<void> {
+  const response = await apiFetch(
+    `/reports/${encodeURIComponent(reportId)}`,
+    { method: 'DELETE' },
+    true,
+  );
+  if (!response.ok) throw new Error(await parseApiError(response));
+}
+
+export async function createReportWithPdf(params: {
+  pdfBlob: Blob;
+  fileId: string;
+  filename?: string;
+  aiDescription?: string | null;
+  manualObservations?: string | null;
+  flags?: string[];
+}): Promise<void> {
+  const token = getAccessToken();
+  if (!token) throw new Error('Sign in to store reports on the server.');
+
+  const form = new FormData();
+  form.append('file', params.pdfBlob, params.filename ?? 'report.pdf');
+  form.append('file_id', params.fileId);
+  if (params.aiDescription) form.append('ai_description', params.aiDescription);
+  if (params.manualObservations) form.append('manual_observations', params.manualObservations);
+  form.append('flags_json', JSON.stringify(params.flags ?? []));
+
+  const response = await fetch(`${API_BASE}/reports/with-pdf`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
+  if (!response.ok) throw new Error(await parseApiError(response));
+}
+
+// ---------- Comparison Drafts ----------
+
+export function listComparisonDrafts(): Promise<ApiComparisonDraft[]> {
+  return getJson<ApiComparisonDraft[]>('/reports/comparison-drafts');
+}
+
+export function getComparisonDraft(draftId: string): Promise<ApiComparisonDraftDetail> {
+  return getJson<ApiComparisonDraftDetail>(
+    `/reports/comparison-drafts/${encodeURIComponent(draftId)}`,
+  );
+}
+
+export async function deleteComparisonDraft(draftId: string): Promise<void> {
+  const response = await apiFetch(
+    `/reports/comparison-drafts/${encodeURIComponent(draftId)}`,
+    { method: 'DELETE' },
+    true,
+  );
+  if (!response.ok) throw new Error(await parseApiError(response));
+}
+
+export async function createComparisonDraft(params: {
+  fileId: string;
+  manualObservations?: string | null;
+  flags?: string[];
+  state: Record<string, unknown>;
+}): Promise<ApiComparisonDraftDetail> {
+  const token = getAccessToken();
+  if (!token) throw new Error('Sign in to store comparison drafts.');
+  const response = await fetch(`${API_BASE}/reports/comparison-drafts`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      file_id: params.fileId,
+      manual_observations: params.manualObservations ?? null,
+      flags: params.flags ?? [],
+      state: params.state,
+    }),
+  });
+  if (!response.ok) throw new Error(await parseApiError(response));
+  return response.json() as Promise<ApiComparisonDraftDetail>;
+}
+
+export async function updateComparisonDraft(params: {
+  draftId: string;
+  fileId?: string;
+  manualObservations?: string | null;
+  flags?: string[];
+  state: Record<string, unknown>;
+}): Promise<ApiComparisonDraftDetail> {
+  const token = getAccessToken();
+  if (!token) throw new Error('Sign in to update comparison drafts.');
+  const response = await fetch(
+    `${API_BASE}/reports/comparison-drafts/${encodeURIComponent(params.draftId)}`,
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        file_id: params.fileId ?? null,
+        manual_observations: params.manualObservations ?? null,
+        flags: params.flags ?? [],
+        state: params.state,
+      }),
+    },
+  );
+  if (!response.ok) throw new Error(await parseApiError(response));
+  return response.json() as Promise<ApiComparisonDraftDetail>;
+}
+
+export async function publishComparisonDrafts(params: {
+  pdfBlob: Blob;
+  fileId: string;
+  draftIds: string[];
+  filename?: string;
+  manualObservations?: string | null;
+  flags?: string[];
+}): Promise<ApiReport> {
+  const token = getAccessToken();
+  if (!token) throw new Error('Sign in to publish comparison reports.');
+  const form = new FormData();
+  form.append('file', params.pdfBlob, params.filename ?? 'comparison-consolidated.pdf');
+  form.append('file_id', params.fileId);
+  form.append('draft_ids_json', JSON.stringify(params.draftIds));
+  if (params.manualObservations) form.append('manual_observations', params.manualObservations);
+  form.append('flags_json', JSON.stringify(params.flags ?? []));
+
+  const response = await fetch(`${API_BASE}/reports/comparison-drafts/publish`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
+  if (!response.ok) throw new Error(await parseApiError(response));
+  return response.json() as Promise<ApiReport>;
+}
+
+// ---------- Viewer Field Drafts ----------
+
+export function listViewerFieldDrafts(): Promise<ApiViewerFieldDraft[]> {
+  return getJson<ApiViewerFieldDraft[]>('/reports/viewer-drafts');
+}
+
+export function getViewerFieldDraft(draftId: string): Promise<ApiViewerFieldDraftDetail> {
+  return getJson<ApiViewerFieldDraftDetail>(
+    `/reports/viewer-drafts/${encodeURIComponent(draftId)}`,
+  );
+}
+
+export async function deleteViewerFieldDraft(draftId: string): Promise<void> {
+  const response = await apiFetch(
+    `/reports/viewer-drafts/${encodeURIComponent(draftId)}`,
+    { method: 'DELETE' },
+    true,
+  );
+  if (!response.ok) throw new Error(await parseApiError(response));
+}
+
+export async function createViewerFieldDraft(params: {
+  fileId: string;
+  viewerKind: string;
+  manualObservations?: string | null;
+  flags?: string[];
+  state: Record<string, unknown>;
+}): Promise<ApiViewerFieldDraftDetail> {
+  const token = getAccessToken();
+  if (!token) throw new Error('Sign in to save report drafts.');
+  const response = await fetch(`${API_BASE}/reports/viewer-drafts`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      file_id: params.fileId,
+      viewer_kind: params.viewerKind,
+      manual_observations: params.manualObservations ?? null,
+      flags: params.flags ?? [],
+      state: params.state,
+    }),
+  });
+  if (!response.ok) throw new Error(await parseApiError(response));
+  return response.json() as Promise<ApiViewerFieldDraftDetail>;
+}
+
+export async function updateViewerFieldDraft(params: {
+  draftId: string;
+  fileId?: string;
+  viewerKind?: string;
+  manualObservations?: string | null;
+  flags?: string[];
+  state: Record<string, unknown>;
+}): Promise<ApiViewerFieldDraftDetail> {
+  const token = getAccessToken();
+  if (!token) throw new Error('Sign in to update report drafts.');
+  const response = await fetch(
+    `${API_BASE}/reports/viewer-drafts/${encodeURIComponent(params.draftId)}`,
+    {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        file_id: params.fileId ?? null,
+        viewer_kind: params.viewerKind ?? null,
+        manual_observations: params.manualObservations ?? null,
+        flags: params.flags ?? [],
+        state: params.state,
+      }),
+    },
+  );
+  if (!response.ok) throw new Error(await parseApiError(response));
+  return response.json() as Promise<ApiViewerFieldDraftDetail>;
+}
+
+export async function publishViewerFieldDraft(params: {
+  draftId: string;
+  pdfBlob: Blob;
+  fileId: string;
+  filename?: string;
+  aiDescription?: string | null;
+  manualObservations?: string | null;
+  flags?: string[];
+}): Promise<ApiReport> {
+  const token = getAccessToken();
+  if (!token) throw new Error('Sign in to publish reports.');
+  const form = new FormData();
+  form.append('file', params.pdfBlob, params.filename ?? 'report.pdf');
+  form.append('file_id', params.fileId);
+  if (params.aiDescription) form.append('ai_description', params.aiDescription);
+  if (params.manualObservations) form.append('manual_observations', params.manualObservations);
+  form.append('flags_json', JSON.stringify(params.flags ?? []));
+
+  const response = await fetch(
+    `${API_BASE}/reports/viewer-drafts/${encodeURIComponent(params.draftId)}/publish`,
+    {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}` },
+      body: form,
+    },
+  );
+  if (!response.ok) throw new Error(await parseApiError(response));
+  return response.json() as Promise<ApiReport>;
+}
+
+export type { ApiMediaFile };

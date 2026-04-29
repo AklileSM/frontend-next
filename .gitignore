@@ -1,0 +1,23 @@
+node_modules
+.next
+out
+build
+dist
+.env
+.env.local
+.env.production
+.env.development
+*.log
+.DS_Store
+.vscode
+.idea
+next-env.d.ts
+tsconfig.tsbuildinfo
+
+# User-uploaded media — served by the backend, not committed to the frontend repo.
+# Keep only static UI assets (e.g. floorplan.jpg) under public/Images/.
+public/Images/panoramas/
+public/Images/thumbnails/
+public/Videos/
+public/PDFs/
+public/PCD/
